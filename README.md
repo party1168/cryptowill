@@ -37,16 +37,24 @@ Only four states are stored. The finer-grained phase (Grace, Claimable, Finaliza
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: createWill (owner proof)
-    Active --> Active: checkIn (owner proof)
-    Active --> ClaimPending: initiateClaim (heir proof)<br/>after interval + grace
-    ClaimPending --> Active: checkIn (owner proof)<br/>before challenge ends
-    ClaimPending --> Claimed: finalizeClaim (anyone)<br/>after challenge ends
-    Active --> Cancelled: cancel (owner proof)
-    ClaimPending --> Cancelled: cancel (owner proof)<br/>before challenge ends
+    [*] --> Active: createWill
+    Active --> Active: checkIn
+    Active --> ClaimPending: initiateClaim
+    ClaimPending --> Active: checkIn
+    ClaimPending --> Claimed: finalizeClaim
+    Active --> Cancelled: cancel
+    ClaimPending --> Cancelled: cancel
     Claimed --> [*]
     Cancelled --> [*]
 ```
+
+| Transition | Called by | World ID proof | Allowed when |
+| --- | --- | --- | --- |
+| `createWill` | owner | owner | the wallet has no active will |
+| `checkIn` | owner | owner | Active, or ClaimPending before the challenge period ends (voids the claim) |
+| `initiateClaim` | anyone | heir | Active, after `checkInInterval + gracePeriod` |
+| `finalizeClaim` | anyone | — | ClaimPending, after the challenge period |
+| `cancel` | owner | owner | Active, or ClaimPending before the challenge period ends |
 
 | Derived phase (`currentPhase`) | Condition |
 | --- | --- |

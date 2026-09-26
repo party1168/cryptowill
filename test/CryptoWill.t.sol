@@ -227,6 +227,36 @@ contract CryptoWillTest is Test {
         assertEq(payout.balance, 2 ether);
     }
 
+    function test_willIdsOfHeir_listsEveryWillNamingTheHeir() public {
+        assertEq(will.willIdsOfHeir(HEIR_N).length, 0);
+
+        uint256 id1 = _create();
+        address owner2 = makeAddr("owner2");
+        vm.deal(owner2, 1 ether);
+        worldId.allow(ROOT, abi.encodePacked(owner2).hashToField(), 777, will.aliveCheckExternalNullifier());
+        vm.prank(owner2);
+        uint256 id2 = will.createWill{value: 1 ether}(ROOT, 777, proof, HEIR_N, INTERVAL, GRACE, CHALLENGE);
+
+        uint256[] memory ids = will.willIdsOfHeir(HEIR_N);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], id1);
+        assertEq(ids[1], id2);
+        assertEq(will.willIdsOfHeir(999).length, 0, "other heirs see nothing");
+    }
+
+    /// History is kept: a cancelled will stays in the index (the frontend shows its phase).
+    function test_willIdsOfHeir_keepsEndedWills() public {
+        uint256 id = _create();
+        vm.prank(owner);
+        will.cancel(id, ROOT, OWNER_N, proof);
+
+        uint256 id2 = _create(); // same owner re-creates, same heir
+        uint256[] memory ids = will.willIdsOfHeir(HEIR_N);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], id);
+        assertEq(ids[1], id2);
+    }
+
     function test_checkIn_onlyOwner() public {
         uint256 id = _create();
         vm.expectRevert(CryptoWill.NotOwner.selector);

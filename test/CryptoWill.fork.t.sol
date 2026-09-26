@@ -138,6 +138,11 @@ contract CryptoWillForkTest is Test {
         vm.prank(o.signalAddress);
         uint256 id = will.createWill{value: 1 ether}(o.root, o.nullifierHash, o.proof, h.nullifierHash, 1, 1, 1);
 
+        // The heir can find this will from their nullifier alone.
+        uint256[] memory heirWills = will.willIdsOfHeir(h.nullifierHash);
+        assertEq(heirWills.length, 1);
+        assertEq(heirWills[0], id);
+
         vm.warp(block.timestamp + 2);
         // Relayed by an arbitrary sender (TD-007).
         vm.prank(makeAddr("relayer"));

@@ -88,6 +88,9 @@ contract CryptoWill {
     mapping(uint256 => Will) public wills; // willId => Will
     mapping(address => uint256) public activeWillOf; // owner => willId（0 表示無進行中）
     uint256 public nextWillId = 1;
+    /// @dev Lookup index only, so an heir (known only by nullifier, never by address) can find their wills.
+    /// Not used for claim enforcement: one-time claim is enforced per will by the state machine (TD-007).
+    mapping(uint256 => uint256[]) internal _willIdsOfHeir; // heirNullifier => willIds
 
     constructor(IWorldID _worldId, string memory _appId, string memory _aliveAction, string memory _claimAction) {
         require(keccak256(bytes(_aliveAction)) != keccak256(bytes(_claimAction)), SameAction());
@@ -134,6 +137,7 @@ contract CryptoWill {
             status: WillStatus.Active
         });
         activeWillOf[msg.sender] = willId;
+        _willIdsOfHeir[heirNullifier].push(willId);
 
         emit WillCreated(willId, msg.sender, msg.value, heirNullifier, checkInInterval, gracePeriod, challengePeriod);
     }
@@ -223,6 +227,11 @@ contract CryptoWill {
     // ---------------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------------
+
+    /// @notice Every will ever created naming this heir, in creation order (including claimed / cancelled ones).
+    function willIdsOfHeir(uint256 heirNullifier) external view returns (uint256[] memory) {
+        return _willIdsOfHeir[heirNullifier];
+    }
 
     /// @notice Earliest timestamp at which the heir may initiate a claim.
     function claimableAt(uint256 willId) public view returns (uint256) {

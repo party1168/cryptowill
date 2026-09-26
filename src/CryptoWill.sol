@@ -4,10 +4,23 @@ pragma solidity ^0.8.28;
 import {IWorldID} from "./interfaces/IWorldID.sol";
 import {ByteHasher} from "./helpers/ByteHasher.sol";
 
+/// @dev Stored states only. "Overdue" is never stored; see WillPhase / currentPhase.
 enum WillStatus {
     None,
     Active,
     ClaimPending,
+    Claimed,
+    Cancelled
+}
+
+/// @dev Phase derived on read from the stored status + timestamps.
+enum WillPhase {
+    None,
+    Active, // before lastCheckIn + checkInInterval
+    Grace, // owner can still check in, heir can't initiate yet
+    Claimable, // heir may initiateClaim; owner can still check in
+    Challenge, // claim pending, owner can still check in / cancel
+    Finalizable, // challenge period over, anyone may finalizeClaim
     Claimed,
     Cancelled
 }
@@ -59,38 +72,36 @@ contract CryptoWill {
     event ClaimFinalized(uint256 indexed willId, address indexed payoutAddress, uint256 amount);
     event WillCancelled(uint256 indexed willId, uint256 amount);
 
-    /// @dev Orb-verified group.
+    /// @dev Orb-verified group (v3 legacy on-chain path).
     uint256 internal constant GROUP_ID = 1;
 
     /// @dev World ID nullifiers are field elements; anything >= this can never match a real proof.
     uint256 internal constant SNARK_SCALAR_FIELD =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
-    /// @dev Operation tags mixed into owner signals so a proof for one operation can't be replayed as another.
-    uint8 internal constant OP_CHECK_IN = 1;
-    uint8 internal constant OP_CANCEL = 2;
-
     IWorldID public immutable worldId;
-    uint256 public immutable EXTERNAL_NULLIFIER_ALIVE;
-    uint256 public immutable EXTERNAL_NULLIFIER_CLAIM;
+    /// @dev From action "cryptowill-alive-check": createWill, checkIn, cancel.
+    uint256 public immutable aliveCheckExternalNullifier;
+    /// @dev From action "cryptowill-heir-claim": initiateClaim.
+    uint256 public immutable heirClaimExternalNullifier;
 
     mapping(uint256 => Will) public wills; // willId => Will
     mapping(address => uint256) public activeWillOf; // owner => willId（0 表示無進行中）
     uint256 public nextWillId = 1;
 
-    constructor(IWorldID _worldId, string memory _appId, string memory _actionAlive, string memory _actionClaim) {
-        require(keccak256(bytes(_actionAlive)) != keccak256(bytes(_actionClaim)), SameAction());
+    constructor(IWorldID _worldId, string memory _appId, string memory _aliveAction, string memory _claimAction) {
+        require(keccak256(bytes(_aliveAction)) != keccak256(bytes(_claimAction)), SameAction());
         worldId = _worldId;
         uint256 appIdHash = abi.encodePacked(_appId).hashToField();
-        EXTERNAL_NULLIFIER_ALIVE = abi.encodePacked(appIdHash, _actionAlive).hashToField();
-        EXTERNAL_NULLIFIER_CLAIM = abi.encodePacked(appIdHash, _actionClaim).hashToField();
+        aliveCheckExternalNullifier = abi.encodePacked(appIdHash, _aliveAction).hashToField();
+        heirClaimExternalNullifier = abi.encodePacked(appIdHash, _claimAction).hashToField();
     }
 
     // ---------------------------------------------------------------------
-    // Owner
+    // Owner — proof signal is always the owner address (msg.sender)
     // ---------------------------------------------------------------------
 
-    /// @notice Lock msg.value into a new will. Proof signal must be abi.encodePacked(msg.sender).
+    /// @notice Lock msg.value into a new will. heirNullifier is not verified here (TD-008).
     function createWill(
         uint256 root,
         uint256 nullifierHash,
@@ -106,9 +117,7 @@ contract CryptoWill {
         require(heirNullifier != 0 && heirNullifier < SNARK_SCALAR_FIELD, InvalidHeirNullifier());
         require(heirNullifier != nullifierHash, HeirIsOwner());
 
-        worldId.verifyProof(
-            root, GROUP_ID, abi.encodePacked(msg.sender).hashToField(), nullifierHash, EXTERNAL_NULLIFIER_ALIVE, proof
-        );
+        _verifyAlive(root, nullifierHash, proof);
 
         willId = nextWillId++;
         wills[willId] = Will({
@@ -129,11 +138,10 @@ contract CryptoWill {
         emit WillCreated(willId, msg.sender, msg.value, heirNullifier, checkInInterval, gracePeriod, challengePeriod);
     }
 
-    /// @notice Prove liveness. While a claim is pending (and its challenge window is open) this also cancels the claim.
-    /// Proof signal must be checkInSignal(willId).
+    /// @notice Prove liveness. While a claim is pending (and its challenge window is open) this also voids the claim.
     function checkIn(uint256 willId, uint256 root, uint256 nullifierHash, uint256[8] calldata proof) external {
         Will storage w = wills[willId];
-        _requireOwnerProof(w, willId, OP_CHECK_IN, root, nullifierHash, proof);
+        _requireOwnerProof(w, root, nullifierHash, proof);
 
         bool challenged = w.status == WillStatus.ClaimPending;
         w.lastCheckIn = uint64(block.timestamp);
@@ -146,10 +154,10 @@ contract CryptoWill {
         emit CheckedIn(willId, uint64(block.timestamp));
     }
 
-    /// @notice Withdraw everything back to the owner. Proof signal must be cancelSignal(willId).
-    function cancelWill(uint256 willId, uint256 root, uint256 nullifierHash, uint256[8] calldata proof) external {
+    /// @notice Withdraw everything back to the owner.
+    function cancel(uint256 willId, uint256 root, uint256 nullifierHash, uint256[8] calldata proof) external {
         Will storage w = wills[willId];
-        _requireOwnerProof(w, willId, OP_CANCEL, root, nullifierHash, proof);
+        _requireOwnerProof(w, root, nullifierHash, proof);
 
         uint256 amount = w.amount;
         w.amount = 0;
@@ -165,8 +173,8 @@ contract CryptoWill {
     // ---------------------------------------------------------------------
 
     /// @notice Start the challenge period after the owner missed the check-in deadline.
-    /// Callable by anyone holding the heir's proof; signal must be claimSignal(willId, payoutAddress)
-    /// so a front-runner can't swap in their own payout address.
+    /// Callable by anyone holding the heir's proof; the proof signal is payoutAddress, so a relayer or
+    /// front-runner can't swap in their own address (TD-007).
     function initiateClaim(
         uint256 willId,
         address payoutAddress,
@@ -183,9 +191,9 @@ contract CryptoWill {
         worldId.verifyProof(
             root,
             GROUP_ID,
-            claimSignal(willId, payoutAddress).hashToField(),
+            abi.encodePacked(payoutAddress).hashToField(),
             nullifierHash,
-            EXTERNAL_NULLIFIER_CLAIM,
+            heirClaimExternalNullifier,
             proof
         );
 
@@ -196,7 +204,7 @@ contract CryptoWill {
         emit ClaimInitiated(willId, payoutAddress, uint64(block.timestamp));
     }
 
-    /// @notice Pay out to the heir once the challenge period has passed. Callable by anyone.
+    /// @notice Pay out once the challenge period has passed. Callable by anyone; no proof needed (TD-009).
     function finalizeClaim(uint256 willId) external {
         Will storage w = wills[willId];
         require(w.status == WillStatus.ClaimPending, InvalidStatus());
@@ -223,34 +231,33 @@ contract CryptoWill {
         return uint256(w.lastCheckIn) + w.checkInInterval + w.gracePeriod;
     }
 
-    /// @notice Raw signal (pre-hashToField) the owner must use for checkIn.
-    function checkInSignal(uint256 willId) external view returns (bytes memory) {
-        return _ownerSignal(wills[willId], willId, OP_CHECK_IN);
-    }
-
-    /// @notice Raw signal (pre-hashToField) the owner must use for cancelWill.
-    function cancelSignal(uint256 willId) external view returns (bytes memory) {
-        return _ownerSignal(wills[willId], willId, OP_CANCEL);
-    }
-
-    /// @notice Raw signal (pre-hashToField) the heir must use for initiateClaim.
-    function claimSignal(uint256 willId, address payoutAddress) public pure returns (bytes memory) {
-        return abi.encodePacked(willId, payoutAddress);
+    /// @notice Current phase, derived from stored status and block.timestamp.
+    function currentPhase(uint256 willId) external view returns (WillPhase) {
+        Will storage w = wills[willId];
+        WillStatus s = w.status;
+        if (s == WillStatus.Active) {
+            if (block.timestamp < uint256(w.lastCheckIn) + w.checkInInterval) return WillPhase.Active;
+            if (block.timestamp < claimableAt(willId)) return WillPhase.Grace;
+            return WillPhase.Claimable;
+        }
+        if (s == WillStatus.ClaimPending) {
+            return block.timestamp < _challengeEnd(w) ? WillPhase.Challenge : WillPhase.Finalizable;
+        }
+        if (s == WillStatus.Claimed) return WillPhase.Claimed;
+        if (s == WillStatus.Cancelled) return WillPhase.Cancelled;
+        return WillPhase.None;
     }
 
     // ---------------------------------------------------------------------
     // Internal
     // ---------------------------------------------------------------------
 
-    /// @dev Shared gate for checkIn / cancelWill: caller is owner, will is live, and a fresh ALIVE proof.
-    function _requireOwnerProof(
-        Will storage w,
-        uint256 willId,
-        uint8 op,
-        uint256 root,
-        uint256 nullifierHash,
-        uint256[8] calldata proof
-    ) internal view {
+    /// @dev Shared gate for checkIn / cancel: caller is owner, will is live, and a valid alive-check proof.
+    /// ownerNullifier is intentionally never marked as used — check-ins repeat forever (TD-001).
+    function _requireOwnerProof(Will storage w, uint256 root, uint256 nullifierHash, uint256[8] calldata proof)
+        internal
+        view
+    {
         require(w.owner == msg.sender, NotOwner());
         if (w.status == WillStatus.ClaimPending) {
             require(block.timestamp < _challengeEnd(w), ChallengeWindowClosed());
@@ -259,14 +266,18 @@ contract CryptoWill {
         }
         require(nullifierHash == w.ownerNullifier, NullifierMismatch());
 
-        worldId.verifyProof(
-            root, GROUP_ID, _ownerSignal(w, willId, op).hashToField(), nullifierHash, EXTERNAL_NULLIFIER_ALIVE, proof
-        );
+        _verifyAlive(root, nullifierHash, proof);
     }
 
-    /// @dev lastCheckIn acts as a nonce: every successful check-in invalidates all previously published proofs.
-    function _ownerSignal(Will storage w, uint256 willId, uint8 op) internal view returns (bytes memory) {
-        return abi.encodePacked(w.owner, willId, w.lastCheckIn, op);
+    function _verifyAlive(uint256 root, uint256 nullifierHash, uint256[8] calldata proof) internal view {
+        worldId.verifyProof(
+            root,
+            GROUP_ID,
+            abi.encodePacked(msg.sender).hashToField(),
+            nullifierHash,
+            aliveCheckExternalNullifier,
+            proof
+        );
     }
 
     function _challengeEnd(Will storage w) internal view returns (uint256) {

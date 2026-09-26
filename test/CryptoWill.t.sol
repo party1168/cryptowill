@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {CryptoWill, WillStatus} from "../src/CryptoWill.sol";
+import {CryptoWill, WillStatus, WillPhase} from "../src/CryptoWill.sol";
 import {IWorldID} from "../src/interfaces/IWorldID.sol";
 import {ByteHasher} from "../src/helpers/ByteHasher.sol";
 
@@ -56,26 +56,18 @@ contract CryptoWillTest is Test {
         vm.deal(owner, 10 ether);
     }
 
-    function _allowCreate() internal {
-        worldId.allow(ROOT, abi.encodePacked(owner).hashToField(), OWNER_N, will.EXTERNAL_NULLIFIER_ALIVE());
+    function _allowOwner() internal {
+        worldId.allow(ROOT, abi.encodePacked(owner).hashToField(), OWNER_N, will.aliveCheckExternalNullifier());
     }
 
     function _create() internal returns (uint256 id) {
-        _allowCreate();
+        _allowOwner();
         vm.prank(owner);
         id = will.createWill{value: 1 ether}(ROOT, OWNER_N, proof, HEIR_N, INTERVAL, GRACE, CHALLENGE);
     }
 
-    function _allowCheckIn(uint256 id) internal {
-        worldId.allow(ROOT, will.checkInSignal(id).hashToField(), OWNER_N, will.EXTERNAL_NULLIFIER_ALIVE());
-    }
-
-    function _allowCancel(uint256 id) internal {
-        worldId.allow(ROOT, will.cancelSignal(id).hashToField(), OWNER_N, will.EXTERNAL_NULLIFIER_ALIVE());
-    }
-
-    function _allowClaim(uint256 id, address to) internal {
-        worldId.allow(ROOT, will.claimSignal(id, to).hashToField(), HEIR_N, will.EXTERNAL_NULLIFIER_CLAIM());
+    function _allowClaim(address to) internal {
+        worldId.allow(ROOT, abi.encodePacked(to).hashToField(), HEIR_N, will.heirClaimExternalNullifier());
     }
 
     function _status(uint256 id) internal view returns (WillStatus s) {
@@ -84,7 +76,7 @@ contract CryptoWillTest is Test {
 
     function _initiate(uint256 id) internal {
         vm.warp(will.claimableAt(id));
-        _allowClaim(id, payout);
+        _allowClaim(payout);
         will.initiateClaim(id, payout, ROOT, HEIR_N, proof);
     }
 
@@ -106,7 +98,7 @@ contract CryptoWillTest is Test {
     }
 
     function test_createWill_revertsOnHeirEqualsOwner() public {
-        _allowCreate();
+        _allowOwner();
         vm.prank(owner);
         vm.expectRevert(CryptoWill.HeirIsOwner.selector);
         will.createWill{value: 1 ether}(ROOT, OWNER_N, proof, OWNER_N, INTERVAL, GRACE, CHALLENGE);
@@ -131,7 +123,7 @@ contract CryptoWillTest is Test {
     }
 
     function test_createWill_signalBoundToSender() public {
-        _allowCreate(); // proof generated for `owner`
+        _allowOwner(); // proof generated for `owner`
         address other = makeAddr("other");
         vm.deal(other, 1 ether);
         vm.prank(other);
@@ -140,7 +132,7 @@ contract CryptoWillTest is Test {
     }
 
     function test_createWill_maxPeriodsDoNotOverflow() public {
-        _allowCreate();
+        _allowOwner();
         vm.prank(owner);
         uint64 max = type(uint64).max;
         uint256 id = will.createWill{value: 1 ether}(ROOT, OWNER_N, proof, HEIR_N, max, max, max);
@@ -152,41 +144,87 @@ contract CryptoWillTest is Test {
     function test_checkIn_resetsDeadline() public {
         uint256 id = _create();
         vm.warp(block.timestamp + INTERVAL);
-        _allowCheckIn(id);
         vm.prank(owner);
         will.checkIn(id, ROOT, OWNER_N, proof);
         assertEq(will.claimableAt(id), block.timestamp + INTERVAL + GRACE);
     }
 
-    function test_checkIn_oldProofNotReplayable() public {
+    /// TD-001: ownerNullifier is never consumed, so the same nullifier checks in repeatedly.
+    function test_checkIn_repeatsWithSameNullifier() public {
         uint256 id = _create();
-        _allowCheckIn(id);
-        vm.warp(block.timestamp + 1);
-        vm.prank(owner);
-        will.checkIn(id, ROOT, OWNER_N, proof);
-
-        // Same proof, next check-in: lastCheckIn moved, signal changed.
-        vm.warp(block.timestamp + 1);
-        vm.prank(owner);
-        vm.expectRevert("bad proof");
-        will.checkIn(id, ROOT, OWNER_N, proof);
+        for (uint256 i = 0; i < 12; i++) {
+            vm.warp(block.timestamp + INTERVAL);
+            vm.prank(owner);
+            will.checkIn(id, ROOT, OWNER_N, proof);
+        }
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Active));
     }
 
-    function test_createProofNotReusableForCheckInOrCancel() public {
-        uint256 id = _create(); // only the createWill signal is registered
+    /// Accepted demo risk (TD-007): owner signal is just the owner address, so one alive-check proof
+    /// is valid for createWill, checkIn and cancel alike (until its root expires).
+    function test_ownerProofSharedAcrossOps_acceptedRisk() public {
+        uint256 id = _create();
         vm.startPrank(owner);
-        vm.expectRevert("bad proof");
         will.checkIn(id, ROOT, OWNER_N, proof);
-        vm.expectRevert("bad proof");
-        will.cancelWill(id, ROOT, OWNER_N, proof);
+        will.cancel(id, ROOT, OWNER_N, proof);
+        vm.stopPrank();
+        assertEq(uint8(_status(id)), uint8(WillStatus.Cancelled));
     }
 
-    function test_checkInProofNotUsableAsCancel() public {
+    function test_checkIn_signalBoundToOwner() public {
         uint256 id = _create();
-        _allowCheckIn(id);
+        // Proof registered for `owner`; a different sender can't pass NotOwner, and the signal is msg.sender anyway.
+        vm.prank(makeAddr("other"));
+        vm.expectRevert(CryptoWill.NotOwner.selector);
+        will.checkIn(id, ROOT, OWNER_N, proof);
+    }
+
+    function test_currentPhase_walksThroughAllPhases() public {
+        uint256 id = _create();
+        uint256 t0 = block.timestamp;
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Active));
+        vm.warp(t0 + INTERVAL);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Grace));
+        vm.warp(t0 + INTERVAL + GRACE);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Claimable));
+
+        _allowClaim(payout);
+        will.initiateClaim(id, payout, ROOT, HEIR_N, proof);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Challenge));
+        vm.warp(block.timestamp + CHALLENGE);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Finalizable));
+        will.finalizeClaim(id);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Claimed));
+
+        assertEq(uint8(will.currentPhase(999)), uint8(WillPhase.None));
+    }
+
+    function test_checkIn_duringGraceAndClaimable() public {
+        uint256 id = _create();
+        vm.warp(will.claimableAt(id) + 100); // Claimable, but nobody initiated
         vm.prank(owner);
-        vm.expectRevert("bad proof");
-        will.cancelWill(id, ROOT, OWNER_N, proof);
+        will.checkIn(id, ROOT, OWNER_N, proof);
+        assertEq(uint8(will.currentPhase(id)), uint8(WillPhase.Active));
+    }
+
+    /// TD-007: one-time claim is enforced per will by the state machine, not a global nullifier mapping,
+    /// so the same heir can inherit from two different owners.
+    function test_sameHeirCanClaimTwoWills() public {
+        uint256 id1 = _create();
+        address owner2 = makeAddr("owner2");
+        vm.deal(owner2, 1 ether);
+        worldId.allow(ROOT, abi.encodePacked(owner2).hashToField(), 777, will.aliveCheckExternalNullifier());
+        vm.prank(owner2);
+        uint256 id2 = will.createWill{value: 1 ether}(ROOT, 777, proof, HEIR_N, INTERVAL, GRACE, CHALLENGE);
+
+        vm.warp(will.claimableAt(id1));
+        _allowClaim(payout);
+        will.initiateClaim(id1, payout, ROOT, HEIR_N, proof);
+        will.initiateClaim(id2, payout, ROOT, HEIR_N, proof);
+        vm.warp(block.timestamp + CHALLENGE);
+        will.finalizeClaim(id1);
+        will.finalizeClaim(id2);
+        assertEq(payout.balance, 2 ether);
     }
 
     function test_checkIn_onlyOwner() public {
@@ -207,7 +245,7 @@ contract CryptoWillTest is Test {
     function test_initiateClaim_tooEarly() public {
         uint256 id = _create();
         vm.warp(will.claimableAt(id) - 1);
-        _allowClaim(id, payout);
+        _allowClaim(payout);
         vm.expectRevert(CryptoWill.NotClaimableYet.selector);
         will.initiateClaim(id, payout, ROOT, HEIR_N, proof);
     }
@@ -215,7 +253,7 @@ contract CryptoWillTest is Test {
     function test_initiateClaim_frontRunCannotSwapPayout() public {
         uint256 id = _create();
         vm.warp(will.claimableAt(id));
-        _allowClaim(id, payout);
+        _allowClaim(payout);
         vm.expectRevert("bad proof");
         will.initiateClaim(id, makeAddr("attacker"), ROOT, HEIR_N, proof);
     }
@@ -250,7 +288,6 @@ contract CryptoWillTest is Test {
         uint256 id = _create();
         _initiate(id);
         vm.warp(block.timestamp + CHALLENGE - 1);
-        _allowCheckIn(id);
         vm.prank(owner);
         will.checkIn(id, ROOT, OWNER_N, proof);
 
@@ -264,7 +301,6 @@ contract CryptoWillTest is Test {
         uint256 id = _create();
         _initiate(id);
         vm.warp(block.timestamp + CHALLENGE);
-        _allowCheckIn(id);
         vm.prank(owner);
         vm.expectRevert(CryptoWill.ChallengeWindowClosed.selector);
         will.checkIn(id, ROOT, OWNER_N, proof);
@@ -274,7 +310,7 @@ contract CryptoWillTest is Test {
         uint256 id = _create();
         address bad = address(new Rejecter());
         vm.warp(will.claimableAt(id));
-        _allowClaim(id, bad);
+        _allowClaim(bad);
         will.initiateClaim(id, bad, ROOT, HEIR_N, proof);
         vm.warp(block.timestamp + CHALLENGE);
         vm.expectRevert(CryptoWill.TransferFailed.selector);
@@ -285,9 +321,8 @@ contract CryptoWillTest is Test {
 
     function test_cancel_refundsAndAllowsNewWill() public {
         uint256 id = _create();
-        _allowCancel(id);
         vm.prank(owner);
-        will.cancelWill(id, ROOT, OWNER_N, proof);
+        will.cancel(id, ROOT, OWNER_N, proof);
         assertEq(owner.balance, 10 ether);
         assertEq(uint8(_status(id)), uint8(WillStatus.Cancelled));
         assertEq(will.activeWillOf(owner), 0);
@@ -299,9 +334,8 @@ contract CryptoWillTest is Test {
     function test_cancel_duringChallengeWindow() public {
         uint256 id = _create();
         _initiate(id);
-        _allowCancel(id);
         vm.prank(owner);
-        will.cancelWill(id, ROOT, OWNER_N, proof);
+        will.cancel(id, ROOT, OWNER_N, proof);
         assertEq(owner.balance, 10 ether);
     }
 
